@@ -15,6 +15,15 @@
 #include <string>
 #include <cmath>
 #include <cstring>
+#include <queue>
+#include <memory>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <future>
+#include <functional>
+#include <stdexcept>
+
 
 
 using namespace llaisys;
@@ -39,7 +48,7 @@ struct Qwen2Weights {
 
 class debug {
 public:
-    debug& get() {
+    static debug& get() {
         static debug instance;
         return instance;
     }
@@ -63,9 +72,85 @@ public:
     }
 
     debug(const debug&) = delete;
+    debug(debug&&) = delete;
     debug& operator=(const debug&) = delete;
 private:
     debug() {}
+};
+
+class ThreadPool {
+public:
+    // 构造函数：启动指定数量的工作线程
+    ThreadPool(size_t threads) : stop(false) {
+        for(size_t i = 0; i < threads; ++i) {
+            workers.emplace_back([this] {
+                for(;;) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(this->queue_mutex);
+                        // 等待任务或停止信号
+                        this->condition.wait(lock, [this]{ 
+                            return this->stop || !this->tasks.empty(); 
+                        });
+                        
+                        // 如果停止且队列为空，则线程退出
+                        if(this->stop && this->tasks.empty()) return;
+                        
+                        // 取得任务
+                        task = std::move(this->tasks.front());
+                        this->tasks.pop();
+                    }
+                    task(); // 执行任务（包装后的 packaged_task）
+                }
+            });
+        }
+    }
+
+    // 核心模板函数：支持任意函数、参数及返回值
+    template<class F, class... Args>
+    auto enqueue(F&& f, Args&&... args) 
+        -> std::future<typename std::result_of<F(Args...)>::type> 
+    {
+        using return_type = typename std::result_of<F(Args...)>::type;
+
+        // 1. 将函数和参数绑定，并封装在 packaged_task 中
+        // 使用 shared_ptr 是为了让 Lambda 闭包能持有它
+        auto task = std::make_shared<std::packaged_task<return_type()>>(
+            std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+        );
+        
+        std::future<return_type> res = task->get_future();
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+
+            // 如果线程池已停止，禁止继续提交任务
+            if(stop) throw std::runtime_error("enqueue on stopped ThreadPool");
+
+            // 2. 将任务包装成 void() 形式放入队列
+            // 当这行 task() 执行时，其实是调用了 packaged_task，从而设置了 future 的值
+            tasks.emplace([task](){ (*task)(); });
+        }
+        condition.notify_one();
+        return res;
+    }
+
+    ~ThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for(std::thread &worker: workers)
+            worker.join();
+    }
+
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    
+    std::mutex queue_mutex;
+    std::condition_variable condition;
+    bool stop;
 };
 
 class Kv_cache {
@@ -82,48 +167,58 @@ public:
         }
     }
 
-    void add(size_t layer_id, const tensor_t& k, const tensor_t& v, size_t seq_len) {//only support cpu for now
+    void add_k(size_t layer_id, const tensor_t& k, size_t seq_len) {//only support cpu for now
         if (layer_id >= nlayer_) {
             throw std::runtime_error("Layer id exceeds the number of layers in the model.");
         }
         auto& k_cache = k_cache_[layer_id];
-        auto& v_cache = v_cache_[layer_id];
         if (total_len_[layer_id] + seq_len > buf_size_[layer_id]) {
             // If the total length exceeds the buffer size, we need to reallocate larger buffers and copy the existing data
             size_t new_buf_size = std::max(buf_size_[layer_id] * 2, total_len_[layer_id] + seq_len);
             auto new_k = Tensor::create({new_buf_size, nkvh_, dh_}, dtype_, device_type_);
-            auto new_v = Tensor::create({new_buf_size, nkvh_, dh_}, dtype_, device_type_);
             llaisys::core::context().runtime().api()->memcpy_sync(
                 new_k->data(),
                 k_cache->data(),
                 total_len_[layer_id] * nkvh_ * dh_ * k_cache->elementSize(),
                 LLAISYS_MEMCPY_H2H
             );
-            llaisys::core::context().runtime().api()->memcpy_sync(
-                new_v->data(),
-                v_cache->data(),
-                total_len_[layer_id] * nkvh_ * dh_ * v_cache->elementSize(),
-                LLAISYS_MEMCPY_H2H
-            );
             k_cache_[layer_id] = new_k;
-            v_cache_[layer_id] = new_v;
             buf_size_[layer_id] = new_buf_size;
         }
-        // Copy the new k and v to the cache at the correct position.
+        // Copy the new k to the cache at the correct position.
         llaisys::core::context().runtime().api()->memcpy_sync(
             k_cache_[layer_id]->data() + total_len_[layer_id] * nkvh_ * dh_ * k->elementSize(),
             k->data(),
             k->numel() * k->elementSize(),
             LLAISYS_MEMCPY_H2H
         );
+        total_len_[layer_id] += seq_len;
+    }
+
+    void add_v(size_t layer_id, const tensor_t& v, size_t seq_len) {
+       if (layer_id >= nlayer_) {
+            throw std::runtime_error("Layer id exceeds the number of layers in the model.");
+        }
+        auto& v_cache = v_cache_[layer_id];
+        if (total_len_[layer_id] + seq_len > buf_size_[layer_id]) {
+            // If the total length exceeds the buffer size, we need to reallocate larger buffers and copy the existing data
+            size_t new_buf_size = std::max(buf_size_[layer_id] * 2, total_len_[layer_id] + seq_len);
+            auto new_v = Tensor::create({new_buf_size, nkvh_, dh_}, dtype_, device_type_);
+            llaisys::core::context().runtime().api()->memcpy_sync(
+                new_v->data(),
+                v_cache->data(),
+                total_len_[layer_id] * nkvh_ * dh_ * v_cache->elementSize(),
+                LLAISYS_MEMCPY_H2H
+            );
+            v_cache_[layer_id] = new_v;
+        }
+        // Copy the new v to the cache at the correct position.
         llaisys::core::context().runtime().api()->memcpy_sync(
             v_cache_[layer_id]->data() + total_len_[layer_id] * nkvh_ * dh_ * v->elementSize(),
             v->data(),
             v->numel() * v->elementSize(),
             LLAISYS_MEMCPY_H2H
         );
-
-        total_len_[layer_id] += seq_len;
     }
 
     tensor_t k(size_t layer_id) {
@@ -151,6 +246,19 @@ private:
     llaisysDataType_t dtype_;
     llaisysDeviceType_t device_type_;
 };
+
+static void linear_rope(
+    tensor_t& output,
+    const tensor_t& input,
+    const tensor_t& weight,
+    const tensor_t& bias,
+    const tensor_t& pos,
+    float theta
+) {
+    using namespace ops;
+    linear(output, input, weight, bias);
+    rope(output, output, pos, theta);
+}
 
 class Qwen2ModelImpl {
 public:
@@ -234,8 +342,6 @@ public:
         auto& tensor_input_ids  = cache.tensor_input_ids;
         auto& x                 = cache.x;
         auto& x_norm            = cache.x_norm;
-        auto& q                 = cache.q;
-        auto& k_                = cache.k_;
         auto& v_                = cache.v_;
         auto& q_rope            = cache.q_rope;
         auto& k_rope            = cache.k_rope;
@@ -257,18 +363,24 @@ public:
         
         for (size_t i = 0; i < meta_.nlayer; i++) {
             rms_norm(x_norm, x, weights_.attn_norm_w[i], meta_.epsilon);
-            //compute q, k, v
-            linear(q, x_norm, weights_.attn_q_w[i], weights_.attn_q_b[i]);
-            linear(k_, x_norm, weights_.attn_k_w[i], weights_.attn_k_b[i]);
-            linear(v_, x_norm, weights_.attn_v_w[i], weights_.attn_v_b[i]);
-            //rope
-            rope(q_rope, q, pos, meta_.theta);
-            rope(k_rope, k_, pos, meta_.theta);
+            //compute q, k, v and rope q, k.
+            auto v_wait = thread_pool_.enqueue([=]() { 
+                linear(v_, x_norm, weights_.attn_v_w[i], weights_.attn_v_b[i]); 
+            });
+            auto k_wait = thread_pool_.enqueue(linear_rope, k_rope, x_norm, weights_.attn_k_w[i], weights_.attn_k_b[i], pos, meta_.theta);
+            auto q_wait = thread_pool_.enqueue(linear_rope, q_rope, x_norm, weights_.attn_q_w[i], weights_.attn_q_b[i], pos, meta_.theta);
             //cache and load k, v
-            kv_cache_.add(i, k_rope, v_, seq_len);
+            v_wait.wait();
+            v_wait = thread_pool_.enqueue([=]() { 
+                kv_cache_.add_v(i, v_, seq_len); 
+            });
+            k_wait.wait();
+            kv_cache_.add_k(i, k_rope, seq_len);
             k = kv_cache_.k(i);
+            v_wait.wait();
             v = kv_cache_.v(i);
             //attention
+            q_wait.wait();
             self_attention(
                 attn_val,
                 q_rope, k, v,
@@ -278,8 +390,14 @@ public:
             add(x, x, attn_out);
             rms_norm(x_norm, x, weights_.mlp_norm_w[i], meta_.epsilon);
             //FFN
-            linear(gate_out, x_norm, weights_.mlp_gate_w[i]);
-            linear(up_out, x_norm, weights_.mlp_up_w[i]);
+            auto gate_wait = thread_pool_.enqueue([=](){
+                linear(gate_out, x_norm, weights_.mlp_gate_w[i]);
+            });
+            auto up_wait = thread_pool_.enqueue([=](){
+                linear(up_out, x_norm, weights_.mlp_up_w[i]);
+            });
+            gate_wait.wait();
+            up_wait.wait();
             swiglu(swiglu_out, gate_out, up_out);
             linear(x_norm, swiglu_out, weights_.mlp_down_w[i]);
             add(x, x, x_norm);
@@ -304,8 +422,6 @@ private:
         tensor_t tensor_input_ids;
         tensor_t x;
         tensor_t x_norm;
-        tensor_t q;
-        tensor_t k_;
         tensor_t v_;
         tensor_t q_rope;
         tensor_t k_rope;
@@ -343,8 +459,6 @@ private:
             infer_buf_.tensor_input_ids  = Tensor::create({seq_len}, LLAISYS_DTYPE_I64, device_, device_ids_[0]);
             infer_buf_.x                 = Tensor::create({seq_len, meta_.hs}, meta_.dtype, device_, device_ids_[0]);
             infer_buf_.x_norm            = Tensor::create({seq_len, meta_.hs}, meta_.dtype, device_, device_ids_[0]);
-            infer_buf_.q                 = Tensor::create({seq_len, meta_.nh, meta_.dh}, meta_.dtype, device_, device_ids_[0]);
-            infer_buf_.k_                = Tensor::create({seq_len, meta_.nkvh, meta_.dh}, meta_.dtype, device_, device_ids_[0]);
             infer_buf_.v_                = Tensor::create({seq_len, meta_.nkvh, meta_.dh}, meta_.dtype, device_, device_ids_[0]);
             infer_buf_.q_rope            = Tensor::create({seq_len, meta_.nh, meta_.dh}, meta_.dtype, device_, device_ids_[0]);
             infer_buf_.k_rope            = Tensor::create({seq_len, meta_.nkvh, meta_.dh}, meta_.dtype, device_, device_ids_[0]);
@@ -359,8 +473,6 @@ private:
             cache.tensor_input_ids = infer_buf_.tensor_input_ids->slice(0, 0, seq_len);
             cache.x = infer_buf_.x->slice(0, 0, seq_len);
             cache.x_norm = infer_buf_.x_norm->slice(0, 0, seq_len);
-            cache.q = infer_buf_.q->slice(0, 0, seq_len);
-            cache.k_ = infer_buf_.k_->slice(0, 0, seq_len);
             cache.v_ = infer_buf_.v_->slice(0, 0, seq_len);
             cache.q_rope = infer_buf_.q_rope->slice(0, 0, seq_len);
             cache.k_rope = infer_buf_.k_rope->slice(0, 0, seq_len);
@@ -384,6 +496,7 @@ private:
     std::vector<int> device_ids_;
     Kv_cache kv_cache_;
     Infer_tensors_buf infer_buf_;
+    ThreadPool thread_pool_{4};
 };
 
 __C {
